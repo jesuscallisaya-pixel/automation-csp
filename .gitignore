@@ -1,0 +1,8 @@
+node_modules/
+.auth/
+test-results/
+playwright-report/
+blob-report/
+output/*
+!output/.gitkeep
+*.png

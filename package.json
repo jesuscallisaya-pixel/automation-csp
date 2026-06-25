@@ -1,0 +1,20 @@
+{
+  "name": "csp-validation",
+  "version": "1.0.0",
+  "description": "Playwright suite that validates the Content-Security-Policy enforced on MyLS (my.legitscript.com) and reports CSP violations for legitimate resources (LS-34808, AC4).",
+  "type": "module",
+  "scripts": {
+    "auth": "playwright test --project=setup --headed",
+    "test": "playwright test --project=myls",
+    "test:headed": "SLOWMO=400 playwright test --project=myls --headed",
+    "test:bg": "mkdir -p output && nohup playwright test --project=myls > output/run.log 2>&1 & echo \"CSP sweep running in background (PID $!). Follow with: tail -f output/run.log\"",
+    "report": "playwright show-report",
+    "grab-state": "node scripts/grab-state.mjs",
+    "cleanup": "node scripts/cleanup-orphans.mjs"
+  },
+  "keywords": ["csp", "security", "playwright", "legitscript", "LS-34808"],
+  "license": "UNLICENSED",
+  "devDependencies": {
+    "@playwright/test": "^1.49.0"
+  }
+}
