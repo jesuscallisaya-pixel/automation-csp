@@ -1,78 +1,73 @@
 # CSP Validation — MyLS (portal-ui)
 
-Playwright suite that validates the **Content-Security-Policy** enforced on the
-MyLS portal (`my.legitscript.com`) and reports any CSP violations that affect
-**legitimate** resources.
+Playwright suite that drives the authenticated **MyLS** portal
+(`my.legitscript.com`) under its **enforced Content-Security-Policy** and reports
+what actually breaks: **CSP violations** on legitimate resources **and** browser
+**console errors** (uncaught exceptions, `console.error`/`warning`, failed/blocked
+requests).
 
-This supports **LS-34808**, acceptance criterion #4:
+Supports **LS-34808**, acceptance criterion #4:
 
 > _Application functions correctly (no CSP violations in browser console for
 > legitimate resources)._
 
-> **Update (nonce + enforce):** the policy moved from hashes to **nonce +
-> strict-dynamic**, now **enforced** at the edge by a Lambda@Edge
-> (`lambda/csp-nonce/index.js`) for the SPA document plus a CloudFront Function
-> (`functions/security-headers.js`) for the static pages. The hash ledger is no
-> longer relevant. The suite now also captures **browser console errors** —
-> uncaught exceptions, `console.error`/`warning`, and failed/blocked requests —
-> written to `output/console-errors.{json,md}` (CSP violations stay in
-> `output/csp-findings.{json,md}`). This is how we find what actually breaks
-> under the enforced policy.
->
-> - **Full sweep by default:** flows that submit (invite/update user, register a
->   merchant, save a filter set) **DO run** so those paths are exercised and any
->   console errors surface. They run against **dev** and only touch
->   test-prefixed data (users: `lsclientportaltest+…`). Set `READONLY=1` to skip
->   the submits if you want a non-mutating sweep.
+---
 
-The CSP header is injected at the edge by a CloudFront `viewer-response`
-function defined in the `iac` repo
-(`terraform/modules/applications/portal-ui/static-page/function/viewer-response.js`).
-This suite drives the real app, captures every `securitypolicyviolation`, and
-writes a findings report you can turn directly into allowlist fixes.
+## TL;DR — get it running
+
+```bash
+npm install            # 1. install deps (uses your local Google Chrome)
+npm run auth           # 2. ONE-TIME interactive login (Google SSO + MFA on phone)
+npm run test           # 3. run the sweep (headless)
+npm run report         # 4. open the Playwright HTML report
+```
+
+Findings for each run land in a timestamped folder:
+**`output/reports/<YYYY-MM-DD_HH-MM-SS>/report.md`** — start there.
 
 ---
 
-## How it works
+## How the policy works (context)
+
+The CSP is **enforced at the edge**, not in the app:
+
+- **SPA document** → Lambda@Edge `lambda/csp-nonce/index.js` (in the `iac` repo)
+  injects a per-request **nonce + `strict-dynamic`** policy.
+- **Static pages** → CloudFront Function `functions/security-headers.js`.
+
+Because the policy uses nonce + strict-dynamic (not hashes), there is **no hash
+list to maintain anymore**. This suite's job is to walk the real app and surface
+anything the enforced policy breaks, so you can decide whether to allowlist a
+resource (`connect-src`, `frame-src`, …) or leave it blocked.
+
+> **Legacy note:** an earlier hash-based policy required collecting `sha256`
+> hashes of inline scripts. That machinery still exists (`output/hash-ledger.*`,
+> the `🔑 hashes` sections in reports) but is **no longer the deliverable** —
+> it only populates if a hash-style violation happens to fire. Ignore it unless
+> you are specifically working on the old policy.
+
+---
+
+## Auth model — why login is manual
 
 MyLS authenticates via **Google SSO + MFA**, which cannot be scripted
-non-interactively (Google blocks automated credential entry, and MFA is
-approved on a phone). We therefore use Playwright's **`storageState`** pattern:
+non-interactively (Google blocks automated credential entry; MFA is approved on a
+phone). We use Playwright's **`storageState`** pattern:
 
-1. **Log in once, by hand** → save the authenticated session to `.auth/state.json`.
-2. **Automated runs reuse** that session to walk all flows and capture CSP
-   violations — no login required until the session expires.
+1. **`npm run auth`** — log in **once, by hand**; the authenticated session is
+   saved to `.auth/state.json`.
+2. **`npm run test`** — automated runs **reuse** that session. No login needed
+   until it expires (just re-run `npm run auth`).
 
-### Flows covered
-
-`tests/csp.spec.ts` exercises, in order:
-
-1. Initial authenticated load (catches the G2 `connect-src` violation).
-2. Auto-discovered in-app routes + a known-route list.
-3. Named interaction flows in `lib/flows.ts` that trigger GTM-injected inline
-   scripts: **Manage Users → invite user**, **Manage Users → update user**,
-   **Merchant Monitoring → click merchant/authoritative URL** (`javascript:`
-   tracking — not hashable, accepted-blocked).
-4. **Sign-out** (run last; ends the session).
-
-Each flow is best-effort: if a button/link isn't found it logs and skips, so the
-sweep never breaks. Selectors use accessible text/roles — adjust in
-`lib/flows.ts` if the real DOM differs.
-
-CSP violations are captured two ways for completeness:
-- `securitypolicyviolation` DOM events (via `addInitScript`, survives navigation),
-- console messages (`Refused to…` / `violates the following Content Security Policy`).
-
-Only violations whose **document is a LegitScript origin** are reported (so
-Auth0/Google pages, which have their own CSP, are ignored).
+`.auth/state.json` is a real session — it is **gitignored, never commit it**.
 
 ---
 
 ## Prerequisites
 
-- Node.js 18+
-- **Google Chrome** installed (the suite uses `channel: 'chrome'`, so no
-  Chromium download is needed).
+- **Node.js 18+**
+- **Google Chrome** installed — the suite uses `channel: 'chrome'`, so no
+  Chromium download happens.
 
 ```bash
 npm install
@@ -80,94 +75,89 @@ npm install
 
 ---
 
-## Usage
+## npm scripts
 
-### 1. Create the auth session (once, interactive)
+| Script | What it does |
+|---|---|
+| `npm run auth` | **Interactive.** Opens real Chrome, you log in, saves `.auth/state.json`. |
+| `npm run test` | The CSP/console sweep, **headless**. |
+| `npm run test:headed` | Same, but **visible** Chrome at `SLOWMO=400ms` so you can watch every flow. |
+| `npm run test:bg` | Headless, **detached** → logs to `output/run.log`. Follow with `tail -f output/run.log`. |
+| `npm run report` | Open the Playwright HTML report. |
+| `npm run cleanup` | Delete leftover `csp-test-*` filter sets the sweep may create (see Scripts). |
+| `npm run grab-state` | Bootstrap `.auth/state.json` from an already-running debug Chrome (see Scripts). |
 
-```bash
-npm run auth
-```
+### Environment variables
 
-A real Chrome window opens. Log in with your LegitScript Google account and
-approve MFA on your phone. When you land back on MyLS the session is saved to
-`.auth/state.json`. Re-run this whenever the session expires.
-
-### 2. Run the CSP validation (automated)
-
-```bash
-npm run test          # headless (foreground)
-npm run test:headed   # opens a visible Chrome and runs slowed (SLOWMO=400ms) so
-                      # you can watch every flow being driven
-npm run test:bg       # headless, detached: runs in the background and logs to
-                      # output/run.log — follow live with: tail -f output/run.log
-```
-
-### 3. Read the findings
-
-- `output/csp-findings.md` — human-readable table + suggested allowlist additions **(this run only)**
-- `output/csp-findings.json` — machine-readable, per-violation detail **(this run only)**
-- `output/hash-ledger.md` / `.json` — **accumulating** record of every hash ever captured, per environment
-- `npm run report` — open the Playwright HTML report
-
-### The hash ledger (cross-run / cross-environment)
-
-`csp-findings.*` is overwritten every run and only shows that run. The **ledger**
-(`output/hash-ledger.json` + `.md`) is append-only: each run merges newly captured
-hashes into it, recording which environment(s) and route(s) each appeared in. It is
-where you read the full hash list to paste into `viewer-response.js`, and how you
-detect drift across environments.
-
-How drift shows up: deploy the same policy to staging/prod and run the sweep there.
-Any inline whose hash is already covered does **not** violate (so it won't reappear —
-that's the "no drift" signal, a clean run). Any inline whose hash **differs** in that
-environment gets blocked → new violation → lands in the ledger flagged under that
-environment in the **"⚠️ Environment-specific hashes"** section. So a non-empty
-staging section = hashes that must be added specifically for staging.
-
-> The ledger lives under `output/` (gitignored), so it persists across runs **on the
-> same machine**. Run the multi-environment sweeps from the same checkout to build a
-> complete cross-environment picture.
-
----
-
-## Targeting another environment
-
-Defaults to development. Override the base URL (the ledger tags captures with the
-environment automatically, derived from the host):
-
-```bash
-MYLS_BASE_URL=https://my.staging.legitscript.com npm run auth
-MYLS_BASE_URL=https://my.staging.legitscript.com npm run test
-```
-
-| Environment | Base URL | Ledger label |
+| Var | Default | Effect |
 |---|---|---|
-| development | `https://my.development.legitscript.net` (default) | `development` |
-| staging | `https://my.staging.legitscript.com` | `staging` |
-| production | `https://my.legitscript.com` | `production` |
+| `MYLS_BASE_URL` | `https://my.development.legitscript.net` | Target environment (see table below). |
+| `READONLY` | unset | `READONLY=1` **skips the submitting flows** (invite/update user, register merchant, save filter set) for a non-mutating sweep. |
+| `NO_SHOTS` | unset | `NO_SHOTS=1` skips the per-violation screenshots. |
+| `SLOWMO` | `0` | Per-action delay in ms (set automatically by `test:headed`). |
+
+> **By default the sweep is a full sweep** and DOES run the submitting flows.
+> They run against **dev** and only touch **test-prefixed data** (users:
+> `lsclientportaltest+jjcs0410-…`, merchants `test-merchant-*`, filter sets
+> `csp-test-*`). Use `READONLY=1` if you want a strictly read-only pass.
 
 ---
 
-## Project layout
+## What the sweep does
 
-```
-csp-validation/
-├─ playwright.config.ts     # projects: "setup" (login) and "myls" (validation)
-├─ tests/
-│  ├─ auth.setup.ts         # interactive login -> saves .auth/state.json
-│  └─ csp.spec.ts           # walks flows, records violations -> output/
-├─ lib/
-│  └─ cspCollector.ts       # capture + dedupe + findings writer
-├─ scripts/
-│  └─ grab-state.mjs        # bootstrap auth state from a running debug Chrome
-└─ output/                  # findings land here (gitignored)
-```
+`tests/csp.spec.ts` walks, in order:
+
+1. **Initial authenticated load** (fails loudly if the saved state is stale).
+2. **Auto-discovered in-app routes** (from nav `<a href="#/…">`) plus a
+   `KNOWN_ROUTES` list (account, merchant-monitoring, merchant-onboarding,
+   lookups, …).
+3. **Named interaction flows** in `lib/flows.ts` — account pages, Merchant
+   Monitoring / Merchant Onboarding lists, the shared filter bar (apply / add /
+   remove / clear / favorite / rename / delete / save-as / paginate / RBAC
+   access filters), Manage Users (invite / edit / activate / deactivate /
+   remove), lookups, S3 screenshot download, API-doc menu items, etc. Each is
+   capped at 35s.
+4. **Sign-out** — run **last**; it ends the session.
+
+Every flow is **best-effort**: if a button/link isn't found (RBAC, entitlements,
+no data) it logs and skips, so the sweep never breaks. Selectors use accessible
+text/roles + real portal-ui selectors — adjust in `lib/flows.ts` if the DOM
+differs.
+
+**Capture is robust:** CSP violations are caught both via
+`securitypolicyviolation` DOM events (survive navigation through `addInitScript`)
+and via console messages; console errors/exceptions/failed-requests are caught
+via `console`/`pageerror`/`requestfailed`. Popups/new tabs are also instrumented
+and auto-closed. Only events whose **document is a LegitScript origin** are
+reported (Auth0/Google pages have their own CSP and are ignored).
 
 ---
 
-## Interpreting a finding
+## Reading the results
 
-Each finding is `directive -> blocked resource`. A common pattern is a resource
+Each run creates **`output/reports/<timestamp>/`** (self-contained, never
+clobbers a previous run):
+
+```
+output/reports/2026-06-25_20-22-49/
+├─ report.md            ← START HERE: CSP + console + screenshot gallery
+├─ report.json          ← machine-readable twin
+├─ csp-findings.md/.json   ← CSP violations only (this run)
+├─ console-errors.md/.json ← functional breakage only (this run)
+└─ screenshots/         ← one PNG per directive+route, taken when a violation fired
+```
+
+`report.md` opens with a verdict line (✅ clean / ⚠️ N violations) and three
+sections: **CSP violations**, **Console findings** (exceptions → failed requests
+→ errors → warnings), and a **screenshot gallery**.
+
+> `output/` is gitignored, so reports persist locally but are not committed.
+
+---
+
+## Interpreting a CSP finding
+
+Each finding is `directive → blocked resource`. A common pattern is a resource
 allowed to **load** but not to **connect**:
 
 | Action | Directive |
@@ -175,29 +165,86 @@ allowed to **load** but not to **connect**:
 | load/run a script | `script-src` |
 | make a network call (fetch/XHR/beacon) | `connect-src` |
 | embed an iframe | `frame-src` |
+| apply inline style | `style-src` |
 
-Example already found in development:
+Example found in development:
 
 ```
-connect-src -> https://tracking-api.g2.com/...
+connect-src → https://tracking-api.g2.com/...
 ```
 
-`script-src` allows `https://*.g2.com` (the G2 script loads), but `connect-src`
-does not, so G2's network call is blocked. Fix: add `https://*.g2.com` to
-`connect-src` in `viewer-response.js`.
+`script-src` allows `https://*.g2.com` (the G2 script loads) but `connect-src`
+does not, so its network call is blocked. Fix: add `https://*.g2.com` to
+`connect-src` at the edge.
 
-> A "violation" only matters if the resource is **legitimate**. Decide per
-> resource whether to allowlist it (it's needed) or leave it blocked (unwanted
-> third party). The report lists candidates; the allowlist decision is yours.
+> A "violation" only matters if the resource is **legitimate**. The report lists
+> candidates; the allowlist decision (allow it vs. leave the unwanted third party
+> blocked) is yours.
+
+---
+
+## Targeting another environment
+
+Defaults to development. Override the base URL for both `auth` and `test`:
+
+```bash
+MYLS_BASE_URL=https://my.staging.legitscript.com npm run auth
+MYLS_BASE_URL=https://my.staging.legitscript.com npm run test
+```
+
+| Environment | Base URL |
+|---|---|
+| development (default) | `https://my.development.legitscript.net` |
+| staging | `https://my.staging.legitscript.com` |
+| production | `https://my.legitscript.com` |
+
+---
+
+## Project layout
+
+```
+csp-validation/
+├─ playwright.config.ts   # projects: "setup" (login) + "myls" (validation)
+├─ tests/
+│  ├─ auth.setup.ts       # interactive login → saves .auth/state.json
+│  └─ csp.spec.ts         # walks routes + flows, writes the timestamped report
+├─ lib/
+│  ├─ flows.ts            # named user flows (the bulk of the coverage)
+│  ├─ cspCollector.ts     # CSP capture, dedupe, screenshots, findings + hash-ledger
+│  ├─ consoleCollector.ts # console errors / exceptions / failed requests
+│  └─ report.ts           # consolidated per-run report.md / report.json
+├─ scripts/               # standalone diagnostic / maintenance helpers (below)
+├─ .auth/state.json       # saved session (gitignored)
+└─ output/                # all findings land here (gitignored)
+```
+
+### Scripts (`scripts/`)
+
+Standalone Node scripts (run with `node scripts/<name>.mjs`). Most reuse
+`.auth/state.json` and honor `MYLS_BASE_URL`; several were one-off diagnostics
+from the old hash-based policy work and are kept for reference.
+
+| Script | Purpose |
+|---|---|
+| `grab-state.mjs` | Export storageState from an already-running debug Chrome (`node scripts/grab-state.mjs <port>`). Alt to `npm run auth`. |
+| `cleanup-orphans.mjs` | Delete leftover `csp-test-*` filter sets the sweep creates. `npm run cleanup`; `HEADED=1` to watch. |
+| `verify-static.mjs` | Check the static pages (`legal.html`, `unsupported-browser.html`) for style-src violations. |
+| `static-hashes.mjs` | Compute sha256 hashes for the static pages' inline content. |
+| `compare-shot.mjs` | A/B screenshots of fixed views (`LABEL=strict` vs `LABEL=unsafe`) → `output/compare/`. |
+| `interact-shot.mjs` | A/B of PrimeNG overlays/menus → `output/interact/`. |
+| `intercom-diag.mjs` / `intercom-shot.mjs` | Diagnose Intercom widget CSP/network behavior. |
+| `probe.mjs` / `bottom-probe.mjs` / `remaining-viol.mjs` | Ad-hoc probes for DOM/PrimeNG classes and residual style-src violations. |
 
 ---
 
 ## Notes / limitations
 
-- The suite **documents** violations; it does not fail the build on them by
+- The suite **documents** findings; it does **not** fail the build on them by
   default. To enforce a clean policy once fixed, un-comment the final
   `expect(findings).toHaveLength(0)` in `tests/csp.spec.ts`.
 - Auto-discovery only finds links present in the DOM at visit time; deep flows
-  behind buttons/wizards may need explicit steps added to `csp.spec.ts`.
-- `.auth/state.json` contains a real session — it is gitignored. Never commit it.
-# automation-csp
+  behind wizards may need explicit steps added to `lib/flows.ts`.
+- MyLS polls continuously and **never goes network-idle** — flows wait on fixed
+  timeouts, not `networkidle`.
+- If a run bounces to the Google/login page, the saved state is stale → run
+  `npm run auth` again.
