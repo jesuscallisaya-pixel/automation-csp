@@ -443,6 +443,84 @@ async function openTestUserMenu(page: Page, status?: 'active' | 'deactivated'): 
   return true; // best-effort; caller's clickByText still attempts the action
 }
 
+/* -------------------------------------------------------------------------
+ * Add Merchant dialog helpers (merchant-upload.component)
+ *
+ * ROOT CAUSE of the 2026-06-26 style-src hash misses: the original sweep only
+ * exercised Merchant Onboarding (MO) "Add Merchants", and even there the Bulk
+ * tab was opened "open only" (no file attached) and Single Merchant was driven
+ * with fill() on 2 hard-coded MO ids. The hashes the user hit live in the
+ * Merchant Monitoring (MM) dialog (merchant-monitoring-v2/components/
+ * merchant-upload), which was never opened, and only render on DEEPER
+ * interaction the sweep never performed:
+ *   - Bulk: selecting a real file flips ls-upload → single-file-display +
+ *     p-progressBar [style] (inline width/height) → style-src hash.
+ *   - Single: the <generic-form> fields (pInputText / pInputTextarea /
+ *     p-dropdown[virtualScroll] / p-chips) inject focus-ring + ng-invalid/
+ *     ng-touched validation + cdk virtual-scroll inline styles ONLY when a real
+ *     user TABS field→field (focus/blur) and opens the dropdown overlay. fill()
+ *     sets values directly and the MO ids don't exist here, so it was a no-op.
+ * These helpers drive both like a human so the inline styles actually render
+ * and cspCollector captures their hashes.
+ * ---------------------------------------------------------------------- */
+
+/** Open the MM "Add Merchants" dialog and switch to the given tab. */
+async function openMMAddMerchant(page: Page, tab: RegExp): Promise<boolean> {
+  await goRoute(page, '#/merchant-monitoring/merchant-list');
+  if (!(await clickByText(page, /add merchants/i, 3000))) {
+    log('MM Add Merchants button not found (entitlement/rbac) — skipped');
+    return false;
+  }
+  await page
+    .locator('.merchant-upload-dialog, .p-dialog:has-text("Add Merchants")')
+    .first()
+    .waitFor({ state: 'visible', timeout: 4000 })
+    .catch(() => {});
+  await clickByText(page, tab, 2500); // "Bulk Upload" | "Single Merchant"
+  await page.waitForTimeout(700);
+  return true;
+}
+
+/** Attach an in-memory CSV to the first hidden file <input> in a dialog. */
+async function attachCsv(page: Page, scope = '.merchant-upload-dialog'): Promise<boolean> {
+  const input = page.locator(`${scope} input[type="file"]`).first();
+  if (!(await input.count())) return false;
+  await input
+    .setInputFiles({
+      name: `csp-test-${Date.now()}.csv`,
+      mimeType: 'text/csv',
+      buffer: Buffer.from('merchant_url,merchant_name\nhttps://test-merchant.com,CSP Test\n'),
+    })
+    .catch(() => {});
+  await settle(page, 1500); // let single-file-display / progressBar / validation render
+  return true;
+}
+
+/** Tab through every visible field of a <generic-form>, typing to dirty each
+ *  (focus ring + ng-invalid/ng-touched validation = inline styles). */
+async function tabThroughFormFields(page: Page, scope: string): Promise<boolean> {
+  const fields = page.locator(`${scope} .form-field :is(input,textarea,.p-dropdown,.p-chips)`);
+  const n = Math.min(await fields.count(), 12);
+  if (n === 0) return false;
+  for (let i = 0; i < n; i++) {
+    const f = fields.nth(i);
+    await f.scrollIntoViewIfNeeded().catch(() => {});
+    await f.click({ timeout: 1000 }).catch(() => {}); // focus → (focus)=onFocus()
+    await page.keyboard.type('test', { delay: 20 }).catch(() => {}); // dirty → validation
+    await page.keyboard.press('Tab').catch(() => {}); // blur → markAsTouched()
+    await page.waitForTimeout(150);
+  }
+  // Open the virtual-scroll p-dropdown overlay (cdk injects height/transform).
+  const dd = page.locator(`${scope} p-dropdown, ${scope} .p-dropdown`).first();
+  if (await dd.isVisible({ timeout: 1200 }).catch(() => false)) {
+    await dd.click().catch(() => {});
+    await page.waitForTimeout(600);
+    await page.keyboard.press('Escape').catch(() => {});
+  }
+  await settle(page);
+  return true;
+}
+
 export const FLOWS: Flow[] = [
   // ---- session / account ----
   {
@@ -593,7 +671,10 @@ export const FLOWS: Flow[] = [
     },
   },
   {
-    name: 'MO → Add Merchants → Bulk Upload tab (open only)',
+    // Was "open only" (never attached a file) — one of the gaps that let the
+    // 2026-06-26 upload style-src hashes slip through. Now attaches a real CSV so
+    // ls-upload's single-file-display + p-progressBar inline styles render.
+    name: 'MO → Add Merchants → Bulk Upload (ATTACH file → upload/progressBar styles)',
     event: 'merchantOnboardingLogMerchantUploadEvent',
     destructive: true,
     run: async (page) => {
@@ -601,8 +682,10 @@ export const FLOWS: Flow[] = [
       const opened = await clickByText(page, /add merchants/i, 2500);
       await page.waitForTimeout(600);
       await clickByText(page, /bulk upload/i, 2000);
-      await settle(page);
-      await dismiss(page);
+      await page.waitForTimeout(500);
+      const attached = await attachCsv(page);
+      if (!attached) log('MO bulk file input not found — opened tab only');
+      await dismiss(page); // Cancel — do NOT submit (non-destructive)
       return opened;
     },
   },
@@ -670,6 +753,30 @@ export const FLOWS: Flow[] = [
       await settle(page);
       await dismiss(page);
       return open;
+    },
+  },
+
+  // ---- Merchant Monitoring → Add Merchant (MM merchant-upload dialog) ----
+  // The module the original sweep MISSED. Source of the 2026-06-26 style-src
+  // hash misses (see openMMAddMerchant / attachCsv / tabThroughFormFields above).
+  {
+    name: 'MM → Add Merchant → Bulk Upload (ATTACH file → upload/progressBar styles)',
+    run: async (page) => {
+      if (!(await openMMAddMerchant(page, /bulk upload/i))) return false;
+      const attached = await attachCsv(page);
+      if (!attached) log('MM bulk file input not found — skipped');
+      await dismiss(page); // Cancel — do NOT submit the upload (non-destructive)
+      return attached;
+    },
+  },
+  {
+    name: 'MM → Add Merchant → Single Merchant (TAB through fields → focus/validation styles)',
+    run: async (page) => {
+      if (!(await openMMAddMerchant(page, /single merchant/i))) return false;
+      const ok = await tabThroughFormFields(page, '.single-merchant-content');
+      if (!ok) log('MM single-merchant form fields not found — skipped');
+      await dismiss(page); // Cancel — never submit
+      return ok;
     },
   },
 
